@@ -2,17 +2,47 @@
   "name": "happyriderscrew",
   "version": "1.0.0",
   "main": "index.js",
+  "homepage": "https://TeJa84625.github.io/HappyRiderCrew",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "predeploy": "expo export",
+    "deploy": "gh-pages -d dist"
   },
   "dependencies": {
+    "@expo/metro-runtime": "~6.1.2",
+    "@expo/vector-icons": "^15.0.3",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-community/datetimepicker": "8.4.4",
+    "@react-native-picker/picker": "2.11.1",
+    "@react-navigation/bottom-tabs": "^7.15.9",
+    "@react-navigation/native": "^7.2.2",
+    "@react-navigation/native-stack": "^7.14.11",
     "expo": "~54.0.33",
+    "expo-av": "~16.0.8",
+    "expo-camera": "~17.0.10",
+    "expo-image-picker": "~17.0.10",
+    "expo-network": "~8.0.8",
+    "expo-router": "~6.0.23",
     "expo-status-bar": "~3.0.9",
+    "firebase": "^12.12.0",
     "react": "19.1.0",
-    "react-native": "0.81.5"
+    "react-dom": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-element-dropdown": "^2.12.4",
+    "react-native-get-random-values": "^2.0.0",
+    "react-native-safe-area-context": "~5.6.0",
+    "react-native-screens": "~4.16.0",
+    "react-native-web": "^0.21.0",
+    "react-native-web-webview": "^1.0.2",
+    "react-native-webview": "13.15.0",
+    "react-native-youtube-iframe": "^2.4.1",
+    "uuid": "^13.0.0"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "gh-pages": "^6.3.0"
+  }
 }
