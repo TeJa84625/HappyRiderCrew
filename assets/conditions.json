@@ -1,0 +1,28 @@
+{
+  "title": "Terms of Service",
+  "lastUpdated": "April 18, 2026",
+  "cities": [
+    "Hyderabad",
+    "Warangal",
+    "Khammam",
+    "Vizag",
+    "Rajahmundry",
+    "Vijayawada",
+    "Guntur",
+    "Tirupati"
+  ],
+  "sections": [
+    {
+      "heading": "1. Driver Partner Agreement",
+      "text": "By registering as a driver partner on Happy Rider's Crew, you agree to follow all local traffic laws, maintain valid documents, and represent the community professionally."
+    },
+    {
+      "heading": "2. Vehicle and Insurance",
+      "text": "Your vehicle must be properly insured. You consent to background and document verification."
+    },
+    {
+      "heading": "3. Account Suspension",
+      "text": "We reserve the right to suspend accounts that violate the safety code of conduct, receive excessive negative ratings, or engage in fraudulent activity."
+    }
+  ]
+}
