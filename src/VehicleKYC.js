@@ -2,14 +2,18 @@ import React, { useState, useRef } from 'react';
 import { 
   StyleSheet, Text, View, TextInput, TouchableOpacity, ScrollView, 
   Image, SafeAreaView, Platform, ActivityIndicator, Alert, 
-  Modal, KeyboardAvoidingView, FlatList 
+  Modal, KeyboardAvoidingView 
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as ImageManipulator from 'expo-image-manipulator'; // Added for compression
+
+// Firebase Imports
 import { doc, updateDoc } from 'firebase/firestore';
-import { db } from './firebase'; 
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { db, storage } from './firebase'; 
 
 const COLORS = { 
   primaryGreen: '#5C832F', 
@@ -60,6 +64,36 @@ export default function VehicleKYC({ navigation }) {
   const [isCameraActive, setIsCameraActive] = useState(false);
   const cameraRef = useRef(null);
 
+  // --- HELPER: Image Optimizer ---
+  const optimizeImage = async (uri) => {
+    try {
+      // 1. First pass: Resize to standard max width and 70% quality
+      let manipResult = await ImageManipulator.manipulateAsync(
+        uri,
+        [{ resize: { width: 1200 } }],
+        { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      // Check size
+      const response = await fetch(manipResult.uri);
+      const blob = await response.blob();
+
+      // 2. Second pass: If still > 1MB, aggressive compression
+      if (blob.size > 1024 * 1024) {
+        manipResult = await ImageManipulator.manipulateAsync(
+          manipResult.uri,
+          [{ resize: { width: 1000 } }],
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG }
+        );
+      }
+      
+      return manipResult.uri;
+    } catch (error) {
+      console.error("Optimization failed", error);
+      return uri;
+    }
+  };
+
   const handleDateChange = (text) => {
     let cleaned = text.replace(/\D/g, '');
     let formatted = cleaned;
@@ -79,9 +113,13 @@ export default function VehicleKYC({ navigation }) {
   };
 
   const pickImage = async (setter, fieldKey) => {
-    let result = await ImagePicker.launchImageLibraryAsync({ quality: 0.6 });
+    let result = await ImagePicker.launchImageLibraryAsync({ 
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 1 
+    });
     if (!result.canceled) {
-      setter(result.assets[0].uri);
+      const optimizedUri = await optimizeImage(result.assets[0].uri);
+      setter(optimizedUri);
       setErrors(prev => ({ ...prev, [fieldKey]: null }));
     }
   };
@@ -108,7 +146,7 @@ export default function VehicleKYC({ navigation }) {
     }
 
     if (!rcDoc || !numberPlate || !vehicleImageFront || !vehicleImageSide || !vehicleImageBack) {
-      Alert.alert("Error", "Please upload all required photos and documents.");
+      Alert.alert("Missing Photos", "Please upload all required vehicle images and the RC document.");
       return false;
     }
 
@@ -116,15 +154,46 @@ export default function VehicleKYC({ navigation }) {
     return Object.keys(e).length === 0;
   };
 
+  // --- FIREBASE STORAGE UPLOAD LOGIC ---
+  const uploadImageAsync = async (uri, folder, fileName) => {
+    if (!uri) return null;
+    const response = await fetch(uri);
+    const blob = await response.blob();
+    
+    // Final size guard before upload
+    if (blob.size > 1024 * 1024) {
+      throw new Error(`File ${fileName} is still over 1MB. Please try a different image.`);
+    }
+
+    const storageRef = ref(storage, `${folder}/${fileName}`);
+    await uploadBytes(storageRef, blob);
+    return await getDownloadURL(storageRef);
+  };
+
   const handleKycSubmit = async () => {
     if (!validate()) return;
     setIsSubmitting(true);
+
     try {
       const rawData = await AsyncStorage.getItem('personalInfo');
       const session = JSON.parse(rawData);
       const mobileId = session?.mobile || session?.personalInfo?.mobile;
 
-      // Base Vehicle Data
+      if (!mobileId) throw new Error("User mobile ID not found. Please log in again.");
+
+      const timestamp = Date.now();
+      const storagePath = `users/${mobileId}/vehicle_docs`;
+
+      // Parallel upload for better performance
+      const [rcUrl, plateUrl, frontUrl, sideUrl, backUrl, rentalUrl] = await Promise.all([
+        uploadImageAsync(rcDoc, storagePath, `rc_${timestamp}.jpg`),
+        uploadImageAsync(numberPlate, storagePath, `plate_${timestamp}.jpg`),
+        uploadImageAsync(vehicleImageFront, storagePath, `front_${timestamp}.jpg`),
+        uploadImageAsync(vehicleImageSide, storagePath, `side_${timestamp}.jpg`),
+        uploadImageAsync(vehicleImageBack, storagePath, `back_${timestamp}.jpg`),
+        formData.ownershipType === 'Rental' ? uploadImageAsync(rentalDoc, storagePath, `rental_${timestamp}.jpg`) : Promise.resolve(null)
+      ]);
+
       let vehiclePayload = {
         vehicleType: formData.vehicleType,
         fuelType: formData.fuelType,
@@ -134,23 +203,23 @@ export default function VehicleKYC({ navigation }) {
         vehicleModel: formData.vehicleModel,
         rcNumber: formData.rcNumber,
         mileage: formData.mileage || "N/A",
-        insurance: formData.insurance === "Yes" ? formData.insuranceNumber : "insurance no",
-        rcDoc,
-        numberPlate,
-        vehicleImages: { front: vehicleImageFront, side: vehicleImageSide, back: vehicleImageBack }
+        insurance: formData.insurance === "Yes" ? formData.insuranceNumber : "No Insurance",
+        rcDocUrl: rcUrl,
+        numberPlateUrl: plateUrl,
+        vehicleImages: { front: frontUrl, side: sideUrl, back: backUrl },
+        submittedAt: new Date().toISOString()
       };
 
-      // Conditional Mapping for Ownership
       if (formData.ownershipType === 'Rental') {
         vehiclePayload.rentalInfo = {
           rentalCompany: formData.rentalCompany,
           rentalOwner: formData.rentalOwner,
           rentalPhone: formData.rentalPhone,
           rentDueDate: formData.rentDueDate,
-          rentalDoc: rentalDoc
+          rentalDocUrl: rentalUrl
         };
       } else if (formData.ownershipType === 'Family/Friends') {
-        vehiclePayload.framilyInfo = {
+        vehiclePayload.familyInfo = {
           relationType: formData.relationType === 'Others' ? formData.otherRelation : formData.relationType,
           ownerName: formData.ownerName,
           ownerAadhar: formData.ownerAadhar,
@@ -159,12 +228,22 @@ export default function VehicleKYC({ navigation }) {
       }
 
       const userRef = doc(db, "users", mobileId);
-      await updateDoc(userRef, { vehicleKycInfo: vehiclePayload, vehicleKycSubmitted: true });
-      await AsyncStorage.setItem('personalInfo', JSON.stringify({ ...session, vehicleKycSubmitted: true, vehicleKycInfo: vehiclePayload }));
+      await updateDoc(userRef, { 
+        vehicleKycInfo: vehiclePayload, 
+        vehicleKycSubmitted: true 
+      });
+
+      await AsyncStorage.setItem('personalInfo', JSON.stringify({ 
+        ...session, 
+        vehicleKycSubmitted: true, 
+        vehicleKycInfo: vehiclePayload 
+      }));
       
+      Alert.alert("Success", "Vehicle documents uploaded and saved!");
       navigation.navigate('PersonKYC');
     } catch (err) {
-      Alert.alert("Error", err.message);
+      console.error(err);
+      Alert.alert("Upload Failed", err.message);
     } finally {
       setIsSubmitting(false);
     }
@@ -182,9 +261,12 @@ export default function VehicleKYC({ navigation }) {
                   <View style={styles.cameraControls}>
                     <TouchableOpacity onPress={() => setIsCameraActive(false)}><Ionicons name="close-circle" size={50} color="#FFF" /></TouchableOpacity>
                     <TouchableOpacity style={styles.captureBtn} onPress={async () => {
-                      const photo = await cameraRef.current.takePictureAsync({ quality: 0.5 });
-                      setNumberPlate("photo.uri");
-                      setIsCameraActive(false);
+                      if (cameraRef.current) {
+                        const photo = await cameraRef.current.takePictureAsync({ quality: 0.8 });
+                        const optimized = await optimizeImage(photo.uri);
+                        setNumberPlate(optimized);
+                        setIsCameraActive(false);
+                      }
                     }}><View style={styles.captureBtnInner} /></TouchableOpacity>
                     <View style={{ width: 50 }} />
                   </View>
@@ -291,6 +373,7 @@ export default function VehicleKYC({ navigation }) {
                 <TouchableOpacity style={styles.cameraBtn} onPress={async () => {
                     const { granted } = await requestCameraPermission();
                     if (granted) setIsCameraActive(true);
+                    else Alert.alert("Permission Required", "Camera access is needed to capture the number plate.");
                 }}><Ionicons name="camera" size={24} color={COLORS.primaryGreen} /><Text style={styles.cameraBtnText}>Open Camera</Text></TouchableOpacity>
               ) : (
                 <View style={styles.previewCard}>
@@ -333,7 +416,12 @@ export default function VehicleKYC({ navigation }) {
               )}
 
               <TouchableOpacity style={[styles.primaryButton, isSubmitting && styles.disabledButton]} onPress={handleKycSubmit} disabled={isSubmitting}>
-                {isSubmitting ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryButtonText}>Save & Continue</Text>}
+                {isSubmitting ? (
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                        <ActivityIndicator color="#FFF" style={{ marginRight: 10 }} />
+                        <Text style={styles.primaryButtonText}>Uploading Documents...</Text>
+                    </View>
+                ) : <Text style={styles.primaryButtonText}>Save & Continue</Text>}
               </TouchableOpacity>
             </ScrollView>
           </View>

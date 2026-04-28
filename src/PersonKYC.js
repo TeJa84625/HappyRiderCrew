@@ -4,19 +4,19 @@ import {
   SafeAreaView, Modal, Image, ActivityIndicator, Platform, KeyboardAvoidingView, Alert
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator'; 
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { doc, setDoc, arrayUnion } from 'firebase/firestore';
-import { db } from './firebase'; 
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'; 
+import { db, storage } from './firebase'; 
 
 const COLORS = { 
   primaryGreen: '#5C832F', darkNavy: '#0F172A', textMuted: '#6B7280', 
   inputBg: '#F9FAFB', borderMuted: '#E5E7EB', errorRed: '#EF4444',
   successGreen: '#10B981', white: '#FFFFFF', blue: '#4A90E2'
 };
-
-const MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024; // 1MB Limit
 
 const InputLabel = ({ title, required }) => (
   <Text style={styles.label}>{title} {required && <Text style={{ color: COLORS.errorRed }}>*</Text>}</Text>
@@ -25,42 +25,6 @@ const InputLabel = ({ title, required }) => (
 const ErrorMsg = ({ error }) => {
   if (!error) return null;
   return <Text style={styles.errorText}>{error}</Text>;
-};
-
-const ImageUpload = ({ title, imageUri, setImageUri, hasError, clearError }) => {
-  const pickFromGallery = async () => {
-    let result = await ImagePicker.launchImageLibraryAsync({ 
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: false, 
-      quality: 0.2 // Compression for Firestore performance
-    });
-    
-    if (!result.canceled) {
-      const fileSize = result.assets[0].fileSize;
-      if (fileSize && fileSize > MAX_FILE_SIZE_BYTES) {
-        Alert.alert("File Too Large", "Please select an image smaller than 1MB");
-        return;
-      }
-      setImageUri(result.assets[0].uri);
-      if (clearError) clearError();
-    }
-  };
-
-  return (
-    <TouchableOpacity 
-      style={[styles.uploadBtn, imageUri && styles.uploadBtnSuccess, hasError && styles.inputError]} 
-      onPress={pickFromGallery}
-    >
-      <Ionicons 
-        name={imageUri ? "checkmark-circle" : "cloud-upload-outline"} 
-        size={24} 
-        color={imageUri ? COLORS.successGreen : hasError ? COLORS.errorRed : COLORS.primaryGreen} 
-      />
-      <Text style={[styles.uploadText, imageUri && {color: COLORS.successGreen}, hasError && {color: COLORS.errorRed}]}>
-        {imageUri ? `${title} Uploaded` : `Upload ${title}`}
-      </Text>
-    </TouchableOpacity>
-  );
 };
 
 export default function PersonKYC({ navigation }) {
@@ -76,26 +40,72 @@ export default function PersonKYC({ navigation }) {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const cameraRef = useRef(null);
 
-  const openCamera = async () => {
-    const { granted } = await requestCameraPermission();
-    if (!granted) {
-      Alert.alert("Permission Required", "Camera access is needed for the live selfie.");
-      return;
+  // --- IMAGE OPTIMIZATION HELPER (Ensures under 1MB) ---
+  const optimizeImage = async (uri) => {
+    try {
+      // Pass 1: Standard Resize & Compression
+      let result = await ImageManipulator.manipulateAsync(
+        uri,
+        [{ resize: { width: 1200 } }],
+        { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      // Check file size
+      const response = await fetch(result.uri);
+      const blob = await response.blob();
+
+      // Pass 2: Aggressive compression if still > 1MB
+      if (blob.size > 1024 * 1024) {
+        result = await ImageManipulator.manipulateAsync(
+          result.uri,
+          [{ resize: { width: 1000 } }],
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG }
+        );
+      }
+      return result.uri;
+    } catch (e) {
+      console.error("Optimization failed", e);
+      return uri;
     }
-    setIsCameraActive(true);
+  };
+
+  const pickImage = async (setter, fieldKey) => {
+    let result = await ImagePicker.launchImageLibraryAsync({ quality: 1 });
+    if (!result.canceled) {
+      const optimized = await optimizeImage(result.assets[0].uri);
+      setter(optimized);
+      setErrors(prev => ({ ...prev, [fieldKey]: null }));
+    }
   };
 
   const takeSelfie = async () => {
     if (cameraRef.current) {
       try {
-        const photo = await cameraRef.current.takePictureAsync({ quality: 0.2 });
-        setSelfie("photo.uri");
+        const photo = await cameraRef.current.takePictureAsync({ quality: 0.8 });
+        const optimized = await optimizeImage(photo.uri);
+        setSelfie(optimized);
         setErrors(prev => ({ ...prev, selfie: null }));
         setIsCameraActive(false);
       } catch (e) {
         Alert.alert("Camera Error", "Failed to capture photo.");
       }
     }
+  };
+
+  // --- FIREBASE STORAGE UPLOAD HELPER WITH SIZE GUARD ---
+  const uploadToStorage = async (uri, path, fieldName) => {
+    if (!uri) return null;
+    const response = await fetch(uri);
+    const blob = await response.blob();
+
+    // Final 1MB Validation check before upload
+    if (blob.size > 1024 * 1024) {
+      throw new Error(`${fieldName} exceeds 1MB. Please try a different photo or lower resolution.`);
+    }
+
+    const storageRef = ref(storage, path);
+    await uploadBytes(storageRef, blob);
+    return await getDownloadURL(storageRef);
   };
 
   const handleValidationAndSubmit = async () => {
@@ -120,39 +130,56 @@ export default function PersonKYC({ navigation }) {
       const personalInfo = JSON.parse(personalInfoRaw);
       const userMobileId = personalInfo.mobile || personalInfo.personalInfo?.mobile;
 
-      // Generate Referral Code
+      if (!userMobileId) throw new Error("User mobile ID not found. Log in again.");
+
+      const timestamp = Date.now();
+      const folder = `users/${userMobileId}/kyc_docs`;
+
+      // 1. Upload All Images to Storage with size checking
+      const [aadhaarUrl, panUrl, dlUrl, selfieUrl] = await Promise.all([
+        uploadToStorage(aadhaarDoc, `${folder}/aadhaar_${timestamp}.jpg`, "Aadhaar Photo"),
+        uploadToStorage(panDoc, `${folder}/pan_${timestamp}.jpg`, "PAN Photo"),
+        uploadToStorage(dlDoc, `${folder}/dl_${timestamp}.jpg`, "DL Photo"),
+        uploadToStorage(selfie, `${folder}/selfie_${timestamp}.jpg`, "Selfie"),
+      ]);
+
+      // 2. Generate Referral Code
       const namePart = (personalInfo.fullName || "USR").substring(0, 3).toUpperCase();
       const hexMobile = parseInt(userMobileId, 10).toString(16).toUpperCase();
       const newReferralCode = `${namePart}${hexMobile}`;
 
       const kycInfo = { 
         ...identity, 
-        aadhaarDoc, 
-        panDoc, 
-        drivingLicenseDoc: dlDoc,
-        selfie 
+        aadhaarDocUrl: aadhaarUrl, 
+        panDocUrl: panUrl, 
+        drivingLicenseDocUrl: dlUrl,
+        selfieUrl: selfieUrl 
       };
 
       const updatePayload = {
         personKycInfo: kycInfo, 
         kycStatus: "submitted", 
         personalKycSubmitted: true,
-        myReferralCode: newReferralCode 
+        myReferralCode: newReferralCode,
+        updatedAt: new Date().toISOString()
       };
 
-      // Firestore Updates
+      // 3. Firestore Updates
       await setDoc(doc(db, "users", userMobileId), updatePayload, { merge: true });
       await setDoc(doc(db, "kyc", "categories"), { pending: arrayUnion(userMobileId) }, { merge: true });
-      await setDoc(doc(db, "referrals", newReferralCode), { ownerId: userMobileId, referredUsers: [] }, { merge: true });
+      
+      // CREATE REFERRAL DOCUMENT
+      await setDoc(doc(db, "referrals", newReferralCode), { 
+        ownerId: userMobileId, 
+        referredUsers: [] 
+      }, { merge: true });
 
-      // Update Local Session
+      // 4. Update Local Session
       const updatedSession = { ...personalInfo, personalKycSubmitted: true, myReferralCode: newReferralCode };
       await AsyncStorage.setItem('personalInfo', JSON.stringify(updatedSession));
 
       setIsSubmitting(false);
-      Alert.alert("Success", "KYC submitted successfully!");
-
-      // Navigate to InitialVideo
+      Alert.alert("Success", "KYC documents uploaded and submitted!");
       navigation.reset({ index: 0, routes: [{ name: 'InitialVideo' }] });
 
     } catch (error) {
@@ -191,12 +218,18 @@ export default function PersonKYC({ navigation }) {
                 keyboardType="number-pad" 
                 maxLength={12} 
                 value={identity.aadhaar}
-                onChangeText={(t) => { setIdentity({...identity, aadhaar: t}); setErrors(p => ({...p, aadhaar: null})); }}
+                onChangeText={(t) => setIdentity({...identity, aadhaar: t})}
               />
               <ErrorMsg error={errors.aadhaar} />
 
               <InputLabel title="Aadhaar Card Photo" required />
-              <ImageUpload title="Aadhaar Card" imageUri={aadhaarDoc} setImageUri={setAadhaarDoc} hasError={errors.aadhaarDoc} clearError={() => setErrors(p => ({...p, aadhaarDoc: null}))} />
+              <TouchableOpacity 
+                style={[styles.uploadBtn, aadhaarDoc && styles.uploadBtnSuccess, errors.aadhaarDoc && styles.inputError]} 
+                onPress={() => pickImage(setAadhaarDoc, 'aadhaarDoc')}
+              >
+                <Ionicons name={aadhaarDoc ? "checkmark-circle" : "cloud-upload-outline"} size={24} color={aadhaarDoc ? COLORS.successGreen : COLORS.primaryGreen} />
+                <Text style={[styles.uploadText, aadhaarDoc && {color: COLORS.successGreen}]}>{aadhaarDoc ? "Aadhaar Added" : "Upload Aadhaar"}</Text>
+              </TouchableOpacity>
               <ErrorMsg error={errors.aadhaarDoc} />
               
               <InputLabel title="PAN Number" required />
@@ -206,12 +239,18 @@ export default function PersonKYC({ navigation }) {
                 autoCapitalize="characters" 
                 maxLength={10} 
                 value={identity.pan}
-                onChangeText={(t) => { setIdentity({...identity, pan: t}); setErrors(p => ({...p, pan: null})); }}
+                onChangeText={(t) => setIdentity({...identity, pan: t})}
               />
               <ErrorMsg error={errors.pan} />
 
               <InputLabel title="PAN Card Photo" required />
-              <ImageUpload title="PAN Card" imageUri={panDoc} setImageUri={setPanDoc} hasError={errors.panDoc} clearError={() => setErrors(p => ({...p, panDoc: null}))} />
+              <TouchableOpacity 
+                style={[styles.uploadBtn, panDoc && styles.uploadBtnSuccess, errors.panDoc && styles.inputError]} 
+                onPress={() => pickImage(setPanDoc, 'panDoc')}
+              >
+                <Ionicons name={panDoc ? "checkmark-circle" : "cloud-upload-outline"} size={24} color={panDoc ? COLORS.successGreen : COLORS.primaryGreen} />
+                <Text style={[styles.uploadText, panDoc && {color: COLORS.successGreen}]}>{panDoc ? "PAN Added" : "Upload PAN"}</Text>
+              </TouchableOpacity>
               <ErrorMsg error={errors.panDoc} />
 
               <InputLabel title="Driving License Number" required />
@@ -220,17 +259,23 @@ export default function PersonKYC({ navigation }) {
                 placeholder="DL Number" 
                 autoCapitalize="characters" 
                 value={identity.drivingLicense}
-                onChangeText={(t) => { setIdentity({...identity, drivingLicense: t}); setErrors(p => ({...p, drivingLicense: null})); }}
+                onChangeText={(t) => setIdentity({...identity, drivingLicense: t})}
               />
               <ErrorMsg error={errors.drivingLicense} />
 
               <InputLabel title="Driving License Photo" required />
-              <ImageUpload title="Driving License" imageUri={dlDoc} setImageUri={setDlDoc} hasError={errors.dlDoc} clearError={() => setErrors(p => ({...p, dlDoc: null}))} />
+              <TouchableOpacity 
+                style={[styles.uploadBtn, dlDoc && styles.uploadBtnSuccess, errors.dlDoc && styles.inputError]} 
+                onPress={() => pickImage(setDlDoc, 'dlDoc')}
+              >
+                <Ionicons name={dlDoc ? "checkmark-circle" : "cloud-upload-outline"} size={24} color={dlDoc ? COLORS.successGreen : COLORS.primaryGreen} />
+                <Text style={[styles.uploadText, dlDoc && {color: COLORS.successGreen}]}>{dlDoc ? "DL Added" : "Upload DL"}</Text>
+              </TouchableOpacity>
               <ErrorMsg error={errors.dlDoc} />
               
               <InputLabel title="Live Selfie" required />
               {!selfie ? (
-                <TouchableOpacity style={[styles.cameraBtn, errors.selfie && styles.inputError]} onPress={openCamera}>
+                <TouchableOpacity style={[styles.cameraBtn, errors.selfie && styles.inputError]} onPress={() => setIsCameraActive(true)}>
                   <Ionicons name="camera" size={24} color={COLORS.primaryGreen} />
                   <Text style={styles.cameraBtnText}>Open Camera for Selfie</Text>
                 </TouchableOpacity>
@@ -239,14 +284,19 @@ export default function PersonKYC({ navigation }) {
                   <Image source={{ uri: selfie }} style={styles.previewImage} />
                   <View style={styles.previewActionRow}>
                     <Text style={styles.successText}>Selfie Captured</Text>
-                    <TouchableOpacity onPress={openCamera}><Text style={styles.retakeText}>Retake</Text></TouchableOpacity>
+                    <TouchableOpacity onPress={() => setIsCameraActive(true)}><Text style={styles.retakeText}>Retake</Text></TouchableOpacity>
                   </View>
                 </View>
               )}
               <ErrorMsg error={errors.selfie} />
 
               <TouchableOpacity style={[styles.primaryButton, isSubmitting && styles.disabledButton]} onPress={handleValidationAndSubmit} disabled={isSubmitting}>
-                {isSubmitting ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryButtonText}>Submit Application</Text>}
+                {isSubmitting ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <ActivityIndicator color="#FFF" style={{ marginRight: 10 }} />
+                    <Text style={styles.primaryButtonText}>Uploading Documents...</Text>
+                  </View>
+                ) : <Text style={styles.primaryButtonText}>Submit Application</Text>}
               </TouchableOpacity>
 
             </ScrollView>
